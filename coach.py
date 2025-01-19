@@ -2,6 +2,7 @@ import os
 import random
 import matplotlib
 import matplotlib.pyplot as plt
+import wandb 
 
 matplotlib.use('Agg')
 
@@ -12,7 +13,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 
 from utils import common, train_utils
-from criteria import id_loss, moco_loss
+from criteria import id_loss, moco_loss, seg_loss
 from configs import data_configs
 from datasets.images_dataset import ImagesDataset
 from criteria.lpips.lpips import LPIPS
@@ -45,6 +46,8 @@ class Coach:
                 self.id_loss = id_loss.IDLoss().to(self.device).eval()
             else:
                 self.id_loss = moco_loss.MocoLoss(opts).to(self.device).eval()
+        # if self.opts.seg_loss_lambda > 0:
+        self.seg_loss = seg_loss.SegLoss(opts).to(self.device).eval() # we always need seg loss
         self.mse_loss = nn.MSELoss().to(self.device).eval()
 
         # Initialize optimizer
@@ -86,6 +89,7 @@ class Coach:
         if prev_train_checkpoint is not None:
             self.load_from_train_checkpoint(prev_train_checkpoint)
             prev_train_checkpoint = None
+        print("init is done")
 
     def load_from_train_checkpoint(self, ckpt):
         print('Loading previous training data...')
@@ -103,6 +107,7 @@ class Coach:
         print(f'Resuming training from step {self.global_step}')
 
     def train(self):
+        wandb.init(project="e4e_modifications", config=self.opts)
         self.net.train()
         if self.opts.progressive_steps:
             self.check_for_progressive_training_update()
@@ -114,6 +119,7 @@ class Coach:
                 x, y, y_hat, latent = self.forward(batch)
                 loss, encoder_loss_dict, id_logs = self.calc_loss(x, y, y_hat, latent)
                 loss_dict = {**loss_dict, **encoder_loss_dict}
+
                 self.optimizer.zero_grad()
                 loss.backward()
                 self.optimizer.step()
@@ -121,6 +127,7 @@ class Coach:
                 # Logging related
                 if self.global_step % self.opts.image_interval == 0 or (
                         self.global_step < 1000 and self.global_step % 25 == 0):
+                    wandb.log(loss_dict, step=self.global_step)
                     self.parse_and_log_images(id_logs, x, y, y_hat, title='images/train/faces')
                 if self.global_step % self.opts.board_interval == 0:
                     self.print_metrics(loss_dict, prefix='train')
@@ -130,8 +137,8 @@ class Coach:
                 val_loss_dict = None
                 if self.global_step % self.opts.val_interval == 0 or self.global_step == self.opts.max_steps:
                     val_loss_dict = self.validate()
-                    if val_loss_dict and (self.best_val_loss is None or val_loss_dict['loss'] < self.best_val_loss):
-                        self.best_val_loss = val_loss_dict['loss']
+                    if val_loss_dict and (self.best_val_loss is None or val_loss_dict['val/loss'] < self.best_val_loss):
+                        self.best_val_loss = val_loss_dict['val/loss']
                         self.checkpoint_me(val_loss_dict, is_best=True)
 
                 if self.global_step % self.opts.save_interval == 0 or self.global_step == self.opts.max_steps:
@@ -169,16 +176,20 @@ class Coach:
             agg_loss_dict.append(cur_loss_dict)
 
             # Logging related
-            self.parse_and_log_images(id_logs, x, y, y_hat,
-                                      title='images/test/faces',
-                                      subscript='{:04d}'.format(batch_idx))
+            if batch_idx % 30 == 0: # 30 for small logged subset
+                self.parse_and_log_images(id_logs, x, y, y_hat,
+                                          title='images/test/faces',
+                                          subscript='{:04d}'.format(batch_idx // 30))
 
             # For first step just do sanity test on small amount of data
             if self.global_step == 0 and batch_idx >= 4:
                 self.net.train()
                 return None  # Do not log, inaccurate in first batch
-
+            
         loss_dict = train_utils.aggregate_loss_dict(agg_loss_dict)
+        print("validate")
+        print(loss_dict)
+        wandb.log(loss_dict,step=self.global_step)
         self.log_metrics(loss_dict, prefix='test')
         self.print_metrics(loss_dict, prefix='test')
 
@@ -229,7 +240,7 @@ class Coach:
         print("Number of test samples: {}".format(len(test_dataset)))
         return train_dataset, test_dataset
 
-    def calc_loss(self, x, y, y_hat, latent):
+    def calc_loss(self, x, y, y_hat, latent): # Calculate loss
         loss_dict = {}
         loss = 0.0
         id_logs = None
@@ -267,12 +278,18 @@ class Coach:
             loss += loss_id * self.opts.id_lambda
         if self.opts.l2_lambda > 0:
             loss_l2 = F.mse_loss(y_hat, y)
-            loss_dict['loss_l2'] = float(loss_l2)
+            loss_dict['loss_l2'] = float(loss_l2) # val 
             loss += loss_l2 * self.opts.l2_lambda
         if self.opts.lpips_lambda > 0:
             loss_lpips = self.lpips_loss(y_hat, y)
-            loss_dict['loss_lpips'] = float(loss_lpips)
+            loss_dict['loss_lpips'] = float(loss_lpips) #val
             loss += loss_lpips * self.opts.lpips_lambda
+        loss_seg, iou, dice, _ = self.seg_loss(y_hat, y)
+        loss_dict['loss_seg'] = float(loss_seg)
+        loss_dict['mean_iou'] = float(iou)
+        loss_dict['mean_dice'] = float(dice)
+        if self.opts.seg_loss_lambda > 0:
+            loss += loss_seg * self.opts.seg_loss_lambda
         loss_dict['loss'] = float(loss)
         return loss, loss_dict, id_logs
 
@@ -301,6 +318,7 @@ class Coach:
                 'target_face': common.tensor2im(y[i]),
                 'output_face': common.tensor2im(y_hat[i]),
             }
+            
             if id_logs is not None:
                 for key in id_logs[i]:
                     cur_im_data[key] = id_logs[i][key]
@@ -309,6 +327,9 @@ class Coach:
 
     def log_images(self, name, im_data, subscript=None, log_latest=False):
         fig = common.vis_faces(im_data)
+        if subscript is None:
+            subscript = "0000"
+        wandb.log({f"{name}_{int(subscript) % 5}": fig},  step=self.global_step)
         step = self.global_step
         if log_latest:
             step = 0
